@@ -12,6 +12,9 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// 两个服务实例共用同一数据库时，BEGIN IMMEDIATE 竞争写锁需等待持锁事务提交：
+// 给足忙等时间（10s），使交错写操作按提交顺序串行复核，而不是立即 BUSY 失败。
+db.pragma('busy_timeout = 10000');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (

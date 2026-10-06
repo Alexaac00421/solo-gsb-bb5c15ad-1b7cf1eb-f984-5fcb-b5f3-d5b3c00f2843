@@ -79,6 +79,17 @@ function bumpDraftVersion() {
   return v;
 }
 
+// 现场写事务统一入口：BEGIN IMMEDIATE 先取写锁，再在同一事务/同一快照内完成
+// 「当前执行版、权限、所见行版本复核 → 写入 → 回执版本视图构建」。
+// 两个服务实例共用同一数据库且操作交错时，后到者等持锁事务提交后才进入，
+// 在锁内读到已推进的行版本并按既有冲突语义（409 VERSION_CONFLICT 等）拒绝过期操作；
+// 先提交者的回执视图在 COMMIT 前构建完成，后续操作的现场排期、资源告警与顺延待确认
+// 记录都不会混入本回执。事务内任一步失败整体回滚，不留部分登记、更正历史、
+// 签认失效或待确认记录。
+function writeTx(fn) {
+  return db.transaction(fn).immediate();
+}
+
 // ---------- 岗位代班（现场临时换人） ----------
 
 function activeDeputyRows(versionId) {
@@ -1141,7 +1152,7 @@ app.post('/api/publish', requireSM, (req, res, next) => {
     // 未传 handover 字段时为 null，完全沿用原有发布行为
     const handover = parseHandoverBody(req.body);
 
-    const result = db.transaction(() => {
+    const out = writeTx(() => {
       const current = Number(getMeta('draft_version', '0'));
       if (submitted === undefined || Number(submitted) !== current) {
         throw new ApiError(409, 'VERSION_CONFLICT',
@@ -1290,18 +1301,20 @@ app.post('/api/publish', requireSM, (req, res, next) => {
 
       const v2 = current + 1; // 发布同时推进草稿版本号，过期页面必须刷新
       setMeta('draft_version', v2);
-      return { versionId, carriedCount: carry.size,
+      const newRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      // 回执视图在同一事务（COMMIT 前）构建：不会混入其他实例随后发布/登记的排期
+      const payload = versionPayload(newRow);
+      return { payload, carriedCount: carry.size,
         sourceVersionId: carry.size ? oldVerForCarry.id : null,
         sourceVersionNo: carry.size ? oldVerForCarry.version_no : null };
-    })();
+    });
 
-    const row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(result.versionId);
     res.status(201).json({
-      ...versionPayload(row),
+      ...out.payload,
       handover: {
-        carriedCount: result.carriedCount,
-        sourceVersionId: result.sourceVersionId,
-        sourceVersionNo: result.sourceVersionNo,
+        carriedCount: out.carriedCount,
+        sourceVersionId: out.sourceVersionId,
+        sourceVersionNo: out.sourceVersionNo,
       },
     });
   } catch (e) { next(e); }
@@ -1454,7 +1467,7 @@ app.post('/api/live/deputies', requireSM, (req, res, next) => {
     if (!position) throw new ApiError(400, 'BAD_INPUT', '请选择要设置代班的岗位');
     if (!username) throw new ApiError(400, 'BAD_INPUT', '请选择代班执行账号');
 
-    const ver = db.transaction(() => {
+    const out = writeTx(() => {
       const v = currentLiveVersionForDeputy(req.body);
       const posExists = db.prepare(
         'SELECT 1 FROM published_cues WHERE version_id = ? AND position = ? LIMIT 1'
@@ -1482,10 +1495,11 @@ app.post('/api/live/deputies', requireSM, (req, res, next) => {
       ).run(v.id, position, u.id, u.username, u.display_name, req.session.user.displayName, stamp);
       // 代班变更：失去该岗位登记权者（原岗位账号）的执行人签认失效（同事务）
       invalidateSignoffsForPositionAuth(v.id, position, stamp);
-      return v;
-    })();
+      // 回执视图在 COMMIT 前构建，授权与签认状态对应本次提交
+      return deputyManagePayload(v, req.session.user);
+    });
 
-    res.status(201).json(deputyManagePayload(ver, req.session.user));
+    res.status(201).json(out);
   } catch (e) { next(e); }
 });
 
@@ -1495,7 +1509,7 @@ app.post('/api/live/deputies/revoke', requireSM, (req, res, next) => {
     const position = String(req.body.position || '').trim();
     if (!position) throw new ApiError(400, 'BAD_INPUT', '请选择要撤销代班的岗位');
 
-    const ver = db.transaction(() => {
+    const out = writeTx(() => {
       const v = currentLiveVersionForDeputy(req.body);
       const existing = db.prepare(
         'SELECT * FROM position_deputies WHERE version_id = ? AND position = ? AND active = 1'
@@ -1508,10 +1522,10 @@ app.post('/api/live/deputies/revoke', requireSM, (req, res, next) => {
         .run(req.session.user.displayName, stamp, existing.id);
       // 代班变更：失去该岗位登记权者（被撤销的代班账号）的执行人签认失效（同事务）
       invalidateSignoffsForPositionAuth(v.id, position, stamp);
-      return v;
-    })();
+      return deputyManagePayload(v, req.session.user);
+    });
 
-    res.json(deputyManagePayload(ver, req.session.user));
+    res.json(out);
   } catch (e) { next(e); }
 });
 
@@ -1533,7 +1547,7 @@ app.post('/api/live/signoffs', requireAuth, (req, res, next) => {
     if (kind === 'sm' && user.role !== 'sm') throw new ApiError(403, 'FORBIDDEN', '仅舞监可签认「可执行」');
     if (kind === 'operator' && user.role !== 'operator') throw new ApiError(403, 'FORBIDDEN', '仅执行岗位可签认「就绪」');
 
-    const ver = db.transaction(() => {
+    const out = writeTx(() => {
       const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
       if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
       const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
@@ -1602,12 +1616,13 @@ app.post('/api/live/signoffs', requireAuth, (req, res, next) => {
         const pr = regStmt.get(versionId, p.from_ref);
         insPred.run(signoffId, p.from_ref, pr ? pr.row_ver : 0);
       }
-      return verRow;
-    })();
+      // 回执视图在 COMMIT 前构建，签认状态对应本次提交（交错提交不会混入）
+      const payload = versionPayload(verRow);
+      if (user.role === 'operator') payload.myPositions = [...effectivePositionsFor(user, verRow.id)];
+      return payload;
+    });
 
-    const payload = versionPayload(ver);
-    if (user.role === 'operator') payload.myPositions = [...effectivePositionsFor(user, ver.id)];
-    res.status(201).json({ version: payload });
+    res.status(201).json({ version: out });
   } catch (e) { next(e); }
 });
 
@@ -1622,7 +1637,7 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
     const action = String(req.body.action || '');
 
     // 同一事务内复核：当前执行版、代班授权、登记行版本；任一不通过整体拒绝，不改动登记
-    const ver = db.transaction(() => {
+    const out = writeTx(() => {
       const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
       if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
       const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
@@ -1742,12 +1757,14 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
         by: actor,
         at: stamp,
       });
-      return verRow;
-    })();
+      // 回执版本视图与资源告警在 COMMIT 前构建：与本次写入及本次新留待确认记录完全对应，
+      // 其他实例交错提交的后续操作不会混入本回执
+      const payload = versionPayload(verRow);
+      payload.myPositions = [...effectivePositionsFor(req.session.user, verRow.id)];
+      return payload;
+    });
 
-    const payload = versionPayload(ver);
-    payload.myPositions = [...effectivePositionsFor(req.session.user, ver.id)];
-    res.json({ version: payload });
+    res.json({ version: out });
   } catch (e) { next(e); }
 });
 
@@ -1773,20 +1790,21 @@ app.post('/api/registrations/corrections', requireSM, (req, res, next) => {
     if (!reason) throw new ApiError(400, 'BAD_INPUT', '请填写更正原因');
     if (reason.length > 200) throw new ApiError(400, 'BAD_INPUT', '更正原因不能超过 200 字');
 
-    const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
-    if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
-    const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
-    if (!latest || latest.id !== ver.id) {
-      throw new ApiError(409, 'VERSION_ARCHIVED',
-        `第 ${ver.version_no} 版已归档（已有新版本发布），归档版本禁止更正，请刷新使用当前执行版本`);
-    }
+    // 全部校验、写入与回执视图构建在同一 IMMEDIATE 事务内：任一不合法均不写入部分更正与历史，
+    // 行版本与岗位登记共用；交错实例的后续排期不混入本回执。
+    const out = writeTx(() => {
+      const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+      if (!latest || latest.id !== ver.id) {
+        throw new ApiError(409, 'VERSION_ARCHIVED',
+          `第 ${ver.version_no} 版已归档（已有新版本发布），归档版本禁止更正，请刷新使用当前执行版本`);
+      }
 
-    const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
-    if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+      const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+      if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
 
-    // 更正仅改现场登记，不动 published_cues（已发布计划）。
-    // 全部校验与写入在同一事务内：任一不合法均不写入部分更正与历史，行版本与岗位登记共用。
-    const result = db.transaction(() => {
+      // 更正仅改现场登记，不动 published_cues（已发布计划）。
       const reg = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
       if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
       // 已跳过项只展示，舞监也不得更正其时间（跳过清除预计结束不可通过更正恢复）
@@ -1894,12 +1912,13 @@ app.post('/api/registrations/corrections', requireSM, (req, res, next) => {
         by: actor,
         at: stamp,
       });
-      return { cascaded: history.length > 1 };
-    })();
+      const cascaded = history.length > 1;
+      // 成功后按现有规则重算后续未开始项及岗位冲突；回执在 COMMIT 前构建
+      const payload = versionPayload(ver);
+      return { payload, cascaded };
+    });
 
-    // 成功后按现有规则重算后续未开始项及岗位冲突（versionPayload 内 computeLive）
-    const payload = versionPayload(ver);
-    res.json({ version: payload, cascaded: result.cascaded });
+    res.json({ version: out.payload, cascaded: out.cascaded });
   } catch (e) { next(e); }
 });
 
@@ -2066,7 +2085,7 @@ app.post('/api/live/skips', requireSM, (req, res, next) => {
       submitted.set(ref, rv);
     }
 
-    const ver = db.transaction(() => {
+    const out = writeTx(() => {
       const v = currentLiveVersionForSkip(req.body);
       const pc = db.prepare('SELECT 1 FROM published_cues WHERE version_id=? AND cue_ref=?').get(v.id, cueRef);
       if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于当前执行版本');
@@ -2168,29 +2187,26 @@ app.post('/api/live/skips', requireSM, (req, res, next) => {
         by: actor,
         at: stamp,
       });
-      return { ver: v, newlySkipped };
-    })();
-
-    const payload = versionPayload(ver.ver);
-    res.json({
-      version: payload,
-      skip: {
-        rootCueRef: cueRef,
-        rootCode: publishedCueMap(ver.ver.id).get(cueRef)?.code ?? null,
-        reason,
-        skippedBy: req.session.user.displayName,
-        newlySkippedCount: ver.newlySkipped,
-        alreadySkippedCount: closureSizeFor(ver.ver.id, cueRef) - ver.newlySkipped,
-        allAlreadySkipped: ver.newlySkipped === 0,
-      },
+      const alreadySkippedCount = closure.size - newlySkipped;
+      // 回执版本视图与资源告警在 COMMIT 前构建：链内跳过状态、链外重算与待确认记录对应本次提交
+      const payload = versionPayload(v);
+      return {
+        payload,
+        summary: {
+          rootCueRef: cueRef,
+          rootCode,
+          reason,
+          skippedBy: actor,
+          newlySkippedCount: newlySkipped,
+          alreadySkippedCount,
+          allAlreadySkipped: newlySkipped === 0,
+        },
+      };
     });
+
+    res.json({ version: out.payload, skip: out.summary });
   } catch (e) { next(e); }
 });
-
-// 链大小（仅响应汇总用）
-function closureSizeFor(versionId, rootRef) {
-  return successorClosure(versionId, rootRef).size;
-}
 
 // ---------- 舞监：现场顺延预演（仅当前执行版，只读） ----------
 
@@ -2370,7 +2386,7 @@ app.post('/api/live/interruptions', requireSM, (req, res, next) => {
     if (!reason) throw new ApiError(400, 'BAD_INPUT', '请填写停排原因（不能为空）');
     if (reason.length > 200) throw new ApiError(400, 'BAD_INPUT', '停排原因不能超过 200 字');
 
-    const result = db.transaction(() => {
+    const out = writeTx(() => {
       const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
       if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
       const latest = latestPublishedVersion();
@@ -2463,14 +2479,15 @@ app.post('/api/live/interruptions', requireSM, (req, res, next) => {
         at: stamp,
       });
 
-      return { verRow, interruptionId: info.lastInsertRowid, clearedCount };
-    })();
+      // 回执版本视图与资源告警在 COMMIT 前构建：清除预计结束、签认失效与本次待确认记录对应本次提交
+      const payload = versionPayload(verRow);
+      return { payload, interruption: payload.activeInterruption, clearedCount };
+    });
 
-    const payload = versionPayload(result.verRow);
     res.status(201).json({
-      version: payload,
-      interruption: payload.activeInterruption,
-      clearedEstimatedEnds: result.clearedCount,
+      version: out.payload,
+      interruption: out.interruption,
+      clearedEstimatedEnds: out.clearedCount,
     });
   } catch (e) {
     if (String(e.code || '').includes('SQLITE_CONSTRAINT')) {
@@ -2490,7 +2507,7 @@ app.post('/api/live/interruptions/resume', requireSM, (req, res, next) => {
     if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的 versionId');
     if (resumeMinute === null) throw new ApiError(400, 'BAD_INPUT', '恢复时刻格式应为 HH:MM');
 
-    const verRow = db.transaction(() => {
+    const out = writeTx(() => {
       const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
       if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
       const latest = latestPublishedVersion();
@@ -2544,14 +2561,15 @@ app.post('/api/live/interruptions/resume', requireSM, (req, res, next) => {
         by: req.session.user.displayName,
         at: stamp,
       });
-      return verRow;
-    })();
+      // 回执版本视图与资源告警在 COMMIT 前构建：顺延重算与本次待确认记录对应本次提交
+      const payload = versionPayload(verRow);
+      return { payload, interruptionId: active.id };
+    });
 
-    const payload = versionPayload(verRow);
-    const rec = payload.interruptions.find((it) => it.active === false && it.resumeText === minToTime(resumeMinute));
+    const interruption = out.payload.interruptions.find((it) => it.id === out.interruptionId) || null;
     res.json({
-      version: payload,
-      interruption: rec || null,
+      version: out.payload,
+      interruption,
     });
   } catch (e) { next(e); }
 });
@@ -2611,7 +2629,7 @@ app.post('/api/live/change-notices/:id/acknowledge', requireAuth, (req, res, nex
     }
     const user = req.session.user;
 
-    const result = db.transaction(() => {
+    const out = writeTx(() => {
       const n = db.prepare('SELECT * FROM schedule_change_notices WHERE id = ?').get(noticeId);
       if (!n) throw new ApiError(404, 'NOT_FOUND', '待确认记录不存在（可能已随版本清理）');
       // 版本归档（发布新版）后拒绝旧提交：待确认仅针对当前执行版
@@ -2643,13 +2661,15 @@ app.post('/api/live/change-notices/:id/acknowledge', requireAuth, (req, res, nex
            SET row_ver = 2, acknowledged_by = ?, acknowledged_by_username = ?, acknowledged_at = ?
          WHERE id = ? AND row_ver = 1`
       ).run(user.displayName, user.username, stamp, noticeId);
-      return db.prepare('SELECT * FROM schedule_change_notices WHERE id = ?').get(noticeId);
-    })();
-
-    res.json({
-      notice: { ...noticeJson(result), versionNo: latestPublishedVersion()?.version_no ?? null },
-      ...(noticeEnvelope(result.version_id, user)),
+      const updated = db.prepare('SELECT * FROM schedule_change_notices WHERE id = ?').get(noticeId);
+      // 清单视图在 COMMIT 前构建：与本次确认提交后的记录状态一致
+      return {
+        notice: { ...noticeJson(updated), versionNo: latest.version_no },
+        envelope: noticeEnvelope(updated.version_id, user),
+      };
     });
+
+    res.json({ notice: out.notice, ...out.envelope });
   } catch (e) { next(e); }
 });
 
@@ -2816,7 +2836,7 @@ app.post('/api/live/review/seal', requireSM, (req, res, next) => {
     }
     const submittedActivePauseId = rawBasis?.activePause ? Number(rawBasis.activePause.id) : null;
 
-    const result = db.transaction(() => {
+    const result = writeTx(() => {
       const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
       if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
       const latest = latestPublishedVersion();
@@ -2906,10 +2926,11 @@ app.post('/api/live/review/seal', requireSM, (req, res, next) => {
         `INSERT INTO rehearsal_reviews(version_id, note, detail_json, summary_json, basis_json, sealed_by, sealed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).run(ver.id, note, JSON.stringify(detail), JSON.stringify(summary), JSON.stringify(basis), actor, stamp);
-      return { ver, stamp, actor };
-    })();
+      // 封存回执在 COMMIT 前构建：快照已写入、明细/汇总即封存时视图
+      return reviewEnvelope(ver);
+    });
 
-    res.status(201).json(reviewEnvelope(result.ver));
+    res.status(201).json(result);
   } catch (e) {
     if (String(e.code || '').includes('SQLITE_CONSTRAINT_UNIQUE')
         || String(e.message || '').includes('UNIQUE constraint failed: rehearsal_reviews.version_id')) {

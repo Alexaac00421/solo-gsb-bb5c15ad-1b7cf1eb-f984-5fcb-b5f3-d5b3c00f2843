@@ -1727,3 +1727,96 @@ curl -b sm.jar -X POST http://localhost:3000/api/live/whatif \
 - **已发布计划**：倒挂与重报都不改 `published_cues`；舞监更正仍按既有校验（保留的预计结束不得早于实际开始，无实际开始则为原计划开始），若更正后再次倒挂，现场同样按暂算口径标出。
 - **停排**：停排仍清除全部未开始项预计结束；恢复后无预计结束即按重算开始 + 时长推算，不会出现倒挂标记。
 - **页面**：现场页与历史回看页对倒挂行显示划线的旧预计结束 +「已过期」、重算结束列「⏱ 暂算结束」；本岗位倒挂行的登记按钮变为「重报预计」并预填暂算结束时刻；非法重报沿现有错误红条提示，不刷新掉其他操作结果。
+
+## 十九、并发写入链路与多实例共用数据库（本轮新增）
+
+岗位登记、舞监更正、依赖链跳过、停排/恢复都会**同时**改变：现场登记、签认效力、顺延待确认记录与现场排期（含同岗位冲突与共享资源告警）。本轮把这些写入链路统一整理为：
+
+> **`BEGIN IMMEDIATE` 写事务内一次性完成「当前执行版复核 → 权限复核 → 所见行版本复核 → 写入（登记 / 更正历史 / 跳过留痕 / 签认失效 / 停排记录 / 待确认留痕）→ 构建回执版本视图」，随后才 COMMIT。**
+
+由此保证：
+
+1. **回执只对应本次提交**：成功响应里的 `version`（`cues` 重算时段、`conflicts`、`resourceAlerts`、`activeInterruption`、签认状态）与本次新留的顺延待确认记录，都取自 **COMMIT 之前同一事务/同一快照**。即使两个服务实例共用同一 SQLite 数据库、操作在时间上交错，先提交者的回执也**不会混入后提交者的排期/告警**；
+2. **交错操作按提交顺序串行**：写事务先取库级写锁（`busy_timeout=10s` 等待），后到者在锁内重新读取登记行版本——先行操作已推进行版本时，持旧版本的提交按**既有冲突语义**收到 409（`VERSION_CONFLICT` / `VERSION_ARCHIVED` / `SKIP_BLOCKED` / `NOTICE_STALE` 等），不会出现 500，也不会覆盖新数据；
+3. **任一失败整体回滚**：版本过期、越权、行版本不符、时间倒挂非法、停排时间冲突等任一不通过，都不留下登记、更正历史、跳过留痕、签认失效或待确认记录；
+4. **既有口径全部保留**：HTTP 接口字段与错误码不变，停排 / 跳过 / 预计结束倒挂暂算规则不变，历史版本仍只读，顺延预演（whatif）仍**只读、不写库、不推进行版本**。
+
+> 两个（或多个）实例用相同的 `DATA_DIR/DB_PATH` 指向同一 `cueboard.db` 即可共用数据（WAL 已开启）。无需额外配置；实例无状态，Session 登录态各自独立。
+
+### 1. 启动两个共用同一数据库的实例
+
+```bash
+# 同一数据库文件，不同端口（SESSION_SECRET 建议生产各自用同一固定值以便共享登录态）
+DATA_DIR=./data PORT=3001 node src/server.js &
+DATA_DIR=./data PORT=3002 node src/server.js &
+```
+
+### 2. 同一行并发重复登记：先提交成功，后提交 409（无 500）
+
+灯光岗位在两个实例上各持同一页面（`rowVersion=1`）同时登记 L1 实际开始：
+
+```bash
+curl -c l1.jar -X POST http://localhost:3001/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"light","password":"light123"}'
+curl -c l2.jar -X POST http://localhost:3002/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"light","password":"light123"}'
+
+BODY='{"versionId":1,"cueRef":1,"rowVersion":1,"action":"start","time":"19:00"}'
+curl -b l1.jar -s -w '\nA:%{http_code}\n' -X POST http://localhost:3001/api/registrations \
+  -H 'Content-Type: application/json' -d "$BODY" &
+curl -b l2.jar -s -w '\nB:%{http_code}\n' -X POST http://localhost:3002/api/registrations \
+  -H 'Content-Type: application/json' -d "$BODY" &
+wait
+```
+
+可能结果（先到先得，二者必居其一，绝不两个都成功，也不会 500）：
+
+```text
+A:200          A 的回执：L1 status=RUNNING、rowVer=2
+B:409          {"error":"VERSION_CONFLICT", "currentRowVersion":2, ...}
+```
+
+### 3. 不同行交错：各自回执只含截至本次提交的排期
+
+实例 A 登记 L1 延误完成（带动后继顺延），实例 B 同时登记 P1 实际开始：
+
+```bash
+# A：L1 完成 19:10（rowVersion 取最新）；B：P1 开始 19:05
+curl -b sm1.jar -s -X POST http://localhost:3001/api/registrations -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":1,"rowVersion":2,"action":"complete","time":"19:10"}' &
+curl -b p2.jar  -s -X POST http://localhost:3002/api/registrations -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":3,"rowVersion":1,"action":"start","time":"19:05"}' &
+wait
+```
+
+- **先提交者回执**：其 `version.cues` 中看不到后提交者的改动（例如 B 先提交时，回执里 L1 仍为 `RUNNING`、P1 已开始）；
+- **后提交者回执**：包含两者的累计结果（L1 `DONE`、P1 `RUNNING`，后继按 L1 实际结束顺延）；
+- 两份回执都**自洽且与提交时刻的库状态一致**，不会出现「自己还没提交的操作出现在回执里」或「回执排期与资源告警自相矛盾」；
+- 顺延待确认记录同理：每次成功操作只为**该事务内**仍未开始且重算开始发生变化的项留痕（`GET /api/live/change-notices` 与回执口径一致）。
+
+### 4. 跳过链 / 停排与登记交错：过期操作按既有语义拒绝，不留部分痕迹
+
+```bash
+# 舞监在 A 实例确认跳过 S1 链；音响在 B 实例同时对链中 S1 登记预计结束
+curl -b sm1.jar -s -w '\nskip:%{http_code}\n' -X POST http://localhost:3001/api/live/skips \
+  -H 'Content-Type: application/json' -d '{"versionId":1,"cueRef":2,"reason":"设备故障","items":[...预览所见行版本...]}' &
+curl -b s2.jar  -s -w '\nestimate:%{http_code}\n' -X POST http://localhost:3002/api/registrations \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":2,"cueRef":2,"rowVersion":1,"action":"estimate","estimatedEndText":"19:09"}' &
+wait
+```
+
+- 登记先提交（S1 行版本推进）→ 跳过收到 **409 `VERSION_CONFLICT`**，链中**无任何一项**被标记、无跳过留痕；
+- 跳过先提交 → 登记收到 **409 `CUE_SKIPPED`**；
+- 停排与登记交错同理：停排先提交则登记收到 **409 `INTERRUPTION_ACTIVE`**；登记先提交则停排回执如实包含该已登记时刻（并按规则校验不被覆盖）。
+
+### 5. 顺延确认的乐观锁并发
+
+同一条待确认记录（`recordVersion=1`）被同岗位账号在两个实例同时确认：一个 **200**（推进到 `recordVersion=2`），另一个收到 **409 `NOTICE_ALREADY_ACKNOWLEDGED`**（不会重复确认、不会误确认其他记录）。
+
+### 6. 只读链路不受影响
+
+- `GET /api/live`、`GET /api/versions/:id`、排期「来源」解释、复盘实时预览为普通只读事务，永远反映读取时的最新已提交状态；
+- `POST /api/live/whatif`（顺延预演）在单个只读事务内核验版本与全部行版本后计算，**不写入、不推进任何版本号**；行版本过期返回 **409 `WHATIF_STALE`**；
+- 历史（已归档）版本的写操作一律 **409 `VERSION_ARCHIVED` / `VERSION_STALE`**，历史视图始终只读。
+
